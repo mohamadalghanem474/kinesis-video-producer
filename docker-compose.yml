@@ -1,0 +1,22 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    container_name: mediamtx
+    ports:
+      - "8554:8554"
+      - "8000:8000/udp"
+      - "8001:8001/udp"
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml
+    restart: always
+
+  kinesis-producer:
+    image: 546150905175.dkr.ecr.us-west-2.amazonaws.com/kinesis-video-producer-sdk-cpp-amazon-${KVS_IMAGE_SUFFIX:-linux}:latest
+    container_name: kinesis-producer
+    depends_on:
+      - mediamtx
+    command: >
+      gst-launch-1.0 -v rtspsrc location="rtsp://mediamtx:8554/mystream" short-header=TRUE latency=100 ! rtph264depay ! h264parse ! video/x-h264,stream-format=avc,alignment=au ! kvssink stream-name="CAM" storage-size=512 access-key="${AWS_ACCESS_KEY_ID}" secret-key="${AWS_SECRET_ACCESS_KEY}" aws-region="${AWS_REGION}"
+    env_file:
+      - .env
+    restart: always
