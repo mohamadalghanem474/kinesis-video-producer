@@ -3,13 +3,14 @@ services:
     image: bluenviron/mediamtx:latest
     container_name: mediamtx
     ports:
-      - "8554:8554"
+      - "8554:8554" # RTSP
+      - "8889:8889" # WebRTC
+      - "8189:8189/udp" # WebRTC ICE
       - "8000:8000/udp"
       - "8001:8001/udp"
-    volumes:
-      - ./mediamtx.yml:/mediamtx.yml
     restart: always
 
+  # Container 1: KVS Video Streams (HLS ~5s delay)
   kinesis-producer:
     image: 546150905175.dkr.ecr.us-west-2.amazonaws.com/kinesis-video-producer-sdk-cpp-amazon-${KVS_IMAGE_SUFFIX:-linux}:latest
     container_name: kinesis-producer
@@ -19,4 +20,42 @@ services:
       gst-launch-1.0 -v rtspsrc location="rtsp://mediamtx:8554/mystream" short-header=TRUE latency=100 ! rtph264depay ! h264parse ! video/x-h264,stream-format=avc,alignment=au ! kvssink stream-name="CAM" storage-size=512 access-key="${AWS_ACCESS_KEY_ID}" secret-key="${AWS_SECRET_ACCESS_KEY}" aws-region="${AWS_REGION}"
     env_file:
       - .env
+    restart: always
+
+  # Container 2: KVS Signaling Channels / WebRTC (<1s delay)
+  kvs-webrtc:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ubuntu:22.04
+        ENV DEBIAN_FRONTEND=noninteractive
+        RUN apt-get update && apt-get install -y \
+            git cmake build-essential pkg-config python3 \
+            libssl-dev libcurl4-openssl-dev liblog4cplus-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav gstreamer1.0-tools \
+            ca-certificates \
+            && rm -rf /var/lib/apt/lists/*
+        WORKDIR /opt
+        RUN git clone --recursive https://github.com/awslabs/amazon-kinesis-video-streams-webrtc-sdk-c.git webrtc-sdk
+        RUN find /opt/webrtc-sdk/samples -name "*.c" -exec grep -l "autovideosrc" {} \; | while read f; do \
+            perl -0777 -i -pe 's{autovideosrc.*?(?=appsink)}{rtspsrc location=rtsp://mediamtx:8554/mystream short-header=true latency=0 ! rtph264depay ! h264parse ! video/x-h264,stream-format=byte-stream,alignment=au ! }s' "$$f" && \
+            echo "Patched: $$f"; done
+        WORKDIR /opt/webrtc-sdk/build
+        RUN cmake -DBUILD_SAMPLE=ON -DBUILD_TEST=OFF .. && make -j$$(nproc)
+        ENV LD_LIBRARY_PATH=/opt/webrtc-sdk/open-source/lib
+        ENTRYPOINT ["./samples/kvsWebrtcClientMasterGstSample"]
+        CMD ["CAM-WEBRTC-CHANNEL"]
+    container_name: kvs-webrtc
+    depends_on:
+      - mediamtx
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+    env_file:
+      - .env
+    command: [ "CAM-WEBRTC-CHANNEL" ]
     restart: always
